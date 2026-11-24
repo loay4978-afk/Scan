@@ -1,60 +1,49 @@
 name: Build PaperScan Pro APK
 
 on:
-  # Run automatically whenever a commit is pushed to any branch.
   push:
-  # Also allow manual runs from the Actions tab.
+    branches:
+      - '**'
+    paths:
+      - 'App.zip'
+      - '.github/workflows/Build.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: paperscan-build-${{ github.ref }}
-  # Keep the active build running; newer pushes wait instead of cancelling it.
-  cancel-in-progress: false
-
 jobs:
   build:
     name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract App.zip and locate Flutter project
-        id: extract
+      - name: Verify uploaded files
         shell: bash
         run: |
-          set -euo pipefail
-          if [ ! -f "App.zip" ]; then
-            echo "ERROR: App.zip was not found in the repository root."
-            echo "Upload App.zip beside the .github folder."
-            exit 1
-          fi
+          test -f App.zip || { echo 'ERROR: App.zip was not found in the repository root.'; exit 1; }
+          unzip -t App.zip
 
+      - name: Extract Flutter project
+        shell: bash
+        run: |
           mkdir -p app_source
-          unzip -oq App.zip -d app_source
-
-          PUBSPEC="$(find app_source -maxdepth 4 -type f -name pubspec.yaml -print -quit)"
-          if [ -z "$PUBSPEC" ]; then
-            echo "ERROR: pubspec.yaml was not found inside App.zip."
-            echo "The ZIP must contain the Flutter project files."
+          unzip -q App.zip -d app_source
+          PUBSPEC_PATH="$(find app_source -name pubspec.yaml -type f -print -quit)"
+          if [ -z "$PUBSPEC_PATH" ]; then
+            echo 'ERROR: pubspec.yaml was not found inside App.zip.'
+            echo 'The ZIP must contain the Flutter project files.'
             exit 1
           fi
+          PROJECT_DIR="$(dirname "$PUBSPEC_PATH")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Flutter project found at: $PROJECT_DIR"
 
-          APP_DIR="$(dirname "$PUBSPEC")"
-          if [ ! -d "$APP_DIR/lib" ]; then
-            echo "ERROR: Flutter lib directory is missing: $APP_DIR/lib"
-            exit 1
-          fi
-
-          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
-          echo "Flutter project found at: $APP_DIR"
-
-      - name: Set up Java 17
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -66,67 +55,110 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Prepare Android platform
-        working-directory: ${{ steps.extract.outputs.app_dir }}
+      - name: Create Android platform if missing
         shell: bash
         run: |
-          set -euo pipefail
-          if [ ! -d android ]; then
-            flutter create --platforms=android --org com.paperscan --project-name paper_scan_pro .
+          if [ ! -d "$PROJECT_DIR/android" ]; then
+            flutter create --platforms=android --org com.paperscan.pro --project-name paper_scan_pro /tmp/paperscan_scaffold
+            cp -a /tmp/paperscan_scaffold/android "$PROJECT_DIR/android"
           fi
 
-          # ML Kit Text Recognition v2 requires Android API 23 or newer.
-          if [ -f android/app/build.gradle.kts ]; then
-            sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' android/app/build.gradle.kts
-            GRADLE_FILE="android/app/build.gradle.kts"
-            DEPENDENCY_LINES='
-              implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
-              implementation("com.google.mlkit:text-recognition-devanagari:16.0.1")
-              implementation("com.google.mlkit:text-recognition-japanese:16.0.1")
-              implementation("com.google.mlkit:text-recognition-korean:16.0.1")
-            '
-          elif [ -f android/app/build.gradle ]; then
-            sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' android/app/build.gradle
-            GRADLE_FILE="android/app/build.gradle"
-            DEPENDENCY_LINES="
-              implementation 'com.google.mlkit:text-recognition-chinese:16.0.1'
-              implementation 'com.google.mlkit:text-recognition-devanagari:16.0.1'
-              implementation 'com.google.mlkit:text-recognition-japanese:16.0.1'
-              implementation 'com.google.mlkit:text-recognition-korean:16.0.1'
-            "
-          else
-            echo "ERROR: Android app Gradle file was not found."
-            exit 1
-          fi
+      - name: Add ML Kit script dependencies safely
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
 
-          # Add the script-specific ML Kit artifacts that the Flutter plugin references.
-          if ! grep -q 'text-recognition-chinese' "$GRADLE_FILE"; then
-            python3 - "$GRADLE_FILE" "$DEPENDENCY_LINES" <<'PYTHON'
-          import pathlib, re, sys
-          path = pathlib.Path(sys.argv[1])
-          lines = sys.argv[2]
-          content = path.read_text()
+          project = Path(os.environ['PROJECT_DIR'])
+          app_dir = project / 'android' / 'app'
+          candidates = [app_dir / 'build.gradle.kts', app_dir / 'build.gradle']
+          gradle_file = next((p for p in candidates if p.is_file()), None)
+          if gradle_file is None:
+              raise SystemExit('ERROR: android/app/build.gradle(.kts) was not found.')
+
+          content = gradle_file.read_text(encoding='utf-8')
+          artifacts = [
+              'com.google.mlkit:text-recognition-chinese:16.0.1',
+              'com.google.mlkit:text-recognition-devanagari:16.0.1',
+              'com.google.mlkit:text-recognition-japanese:16.0.1',
+              'com.google.mlkit:text-recognition-korean:16.0.1',
+          ]
+
+          is_kotlin = gradle_file.name.endswith('.kts')
+          lines = []
+          for artifact in artifacts:
+              if is_kotlin:
+                  lines.append(f'    implementation("{artifact}")')
+              else:
+                  lines.append(f"    implementation '{artifact}'")
+
+          # Locate dependencies { ... } while balancing braces, rather than
+          # assuming that a dependencies block already exists.
           match = re.search(r'(?m)^\s*dependencies\s*\{', content)
-          if not match:
-              raise SystemExit("ERROR: dependencies { block not found in " + str(path))
-          insert_at = match.end()
-          content = content[:insert_at] + "\n" + lines.strip("\n") + content[insert_at:]
-          path.write_text(content)
-          PYTHON
-          fi
+          if match:
+              open_brace = content.find('{', match.start())
+              depth = 0
+              close_brace = None
+              quote = None
+              escaped = False
+              for i in range(open_brace, len(content)):
+                  ch = content[i]
+                  if quote:
+                      if escaped:
+                          escaped = False
+                      elif ch == '\\':
+                          escaped = True
+                      elif ch == quote:
+                          quote = None
+                      continue
+                  if ch in ('"', "'"):
+                      quote = ch
+                  elif ch == '{':
+                      depth += 1
+                  elif ch == '}':
+                      depth -= 1
+                      if depth == 0:
+                          close_brace = i
+                          break
+              if close_brace is None:
+                  raise SystemExit('ERROR: dependencies block exists but its closing brace is missing.')
+              block = content[open_brace + 1:close_brace]
+              additions = []
+              for artifact, line in zip(artifacts, lines):
+                  if artifact not in block:
+                      additions.append(line)
+              if additions:
+                  insertion = '\n' + '\n'.join(additions) + '\n'
+                  content = content[:close_brace] + insertion + content[close_brace:]
+          else:
+              content = content.rstrip() + '\n\ndependencies {\n' + '\n'.join(lines) + '\n}\n'
+
+          # ML Kit requires Android API 23 or newer. Set it when the
+          # generated Flutter Gradle file exposes a minSdk declaration.
+          if is_kotlin:
+              content = re.sub(r'(?m)(\bminSdk\s*=\s*)(?:flutter\.minSdkVersion|\d+)', r'\g<1>23', content)
+          else:
+              content = re.sub(r'(?m)(\bminSdkVersion\s+)(?:flutter\.minSdkVersion|\d+)', r'\g<1>23', content)
+
+          gradle_file.write_text(content, encoding='utf-8')
+          print(f'Updated {gradle_file}')
+          print('Added all four ML Kit script dependencies (without requiring an existing dependencies block).')
+          PY
 
       - name: Get Flutter dependencies
-        working-directory: ${{ steps.extract.outputs.app_dir }}
+        working-directory: ${{ env.PROJECT_DIR }}
         run: flutter pub get
 
       - name: Build release APK
-        working-directory: ${{ steps.extract.outputs.app_dir }}
+        working-directory: ${{ env.PROJECT_DIR }}
         run: flutter build apk --release
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: PaperScan-Pro-APK
-          path: ${{ steps.extract.outputs.app_dir }}/build/app/outputs/flutter-apk/app-release.apk
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 14
