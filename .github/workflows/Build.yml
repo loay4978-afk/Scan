@@ -11,7 +11,8 @@ permissions:
 
 concurrency:
   group: paperscan-build-${{ github.ref }}
-  cancel-in-progress: true
+  # Keep the active build running; newer pushes wait instead of cancelling it.
+  cancel-in-progress: false
 
 jobs:
   build:
