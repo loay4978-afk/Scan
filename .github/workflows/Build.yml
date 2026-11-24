@@ -75,10 +75,44 @@ jobs:
             flutter create --platforms=android --org com.paperscan --project-name paper_scan_pro .
           fi
 
+          # ML Kit Text Recognition v2 requires Android API 23 or newer.
           if [ -f android/app/build.gradle.kts ]; then
-            sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 21/' android/app/build.gradle.kts
+            sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' android/app/build.gradle.kts
+            GRADLE_FILE="android/app/build.gradle.kts"
+            DEPENDENCY_LINES='
+              implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+              implementation("com.google.mlkit:text-recognition-devanagari:16.0.1")
+              implementation("com.google.mlkit:text-recognition-japanese:16.0.1")
+              implementation("com.google.mlkit:text-recognition-korean:16.0.1")
+            '
           elif [ -f android/app/build.gradle ]; then
-            sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 21/' android/app/build.gradle
+            sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' android/app/build.gradle
+            GRADLE_FILE="android/app/build.gradle"
+            DEPENDENCY_LINES="
+              implementation 'com.google.mlkit:text-recognition-chinese:16.0.1'
+              implementation 'com.google.mlkit:text-recognition-devanagari:16.0.1'
+              implementation 'com.google.mlkit:text-recognition-japanese:16.0.1'
+              implementation 'com.google.mlkit:text-recognition-korean:16.0.1'
+            "
+          else
+            echo "ERROR: Android app Gradle file was not found."
+            exit 1
+          fi
+
+          # Add the script-specific ML Kit artifacts that the Flutter plugin references.
+          if ! grep -q 'text-recognition-chinese' "$GRADLE_FILE"; then
+            python3 - "$GRADLE_FILE" "$DEPENDENCY_LINES" <<'PYTHON'
+          import pathlib, re, sys
+          path = pathlib.Path(sys.argv[1])
+          lines = sys.argv[2]
+          content = path.read_text()
+          match = re.search(r'(?m)^\s*dependencies\s*\{', content)
+          if not match:
+              raise SystemExit("ERROR: dependencies { block not found in " + str(path))
+          insert_at = match.end()
+          content = content[:insert_at] + "\n" + lines.strip("\n") + content[insert_at:]
+          path.write_text(content)
+          PYTHON
           fi
 
       - name: Get Flutter dependencies
